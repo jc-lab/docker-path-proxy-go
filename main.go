@@ -72,13 +72,12 @@ func main() {
 		path, _ := strings.CutPrefix(request.RequestURI, "/v2/")
 		pos := strings.Index(path, "/")
 		if pos < 0 {
-			http.NotFound(writer, request)
+			writer.WriteHeader(http.StatusOK)
 			return
 		}
 
 		domain := path[:pos]
 		suffix := path[pos+1:]
-		_ = suffix
 
 		var baseUrl string
 		registry := registries[domain]
@@ -100,6 +99,12 @@ func main() {
 			log.Printf("%s %d: %v", request.RequestURI, http.StatusInternalServerError, err)
 			http.Error(writer, "server error: "+err.Error(), http.StatusInternalServerError)
 			return
+		}
+
+		for key, values := range request.Header {
+			for _, value := range values {
+				newRequest.Header.Add(key, value)
+			}
 		}
 
 		if registry != nil && registry.Username != "" {
