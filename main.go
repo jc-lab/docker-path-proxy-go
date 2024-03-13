@@ -28,6 +28,11 @@ func getEnvOrDefault(name string, def string) string {
 	return value
 }
 
+func getEnvAsBool(name string) bool {
+	value := strings.ToLower(os.Getenv(name))
+	return value == "true"
+}
+
 type DohApp struct {
 	ctx        context.Context
 	c          *doh.DoH
@@ -56,7 +61,7 @@ func main() {
 	var app DohApp
 	var flagConfig string
 	var flagPort int
-	var flagUseDoh bool
+	var flagUseDoh = getEnvAsBool("USE_DOH")
 
 	defaultPort, err := strconv.Atoi(getEnvOrDefault("PORT", "8000"))
 	if err != nil {
@@ -65,7 +70,7 @@ func main() {
 
 	flag.IntVar(&flagPort, "port", defaultPort, "listen port (env: PORT)")
 	flag.StringVar(&flagConfig, "config", os.Getenv("CONFIG_FILE"), "config file path (env: CONFIG_FILE)")
-	flag.BoolVar(&flagUseDoh, "use-doh", false, "use dns over https")
+	flag.BoolVar(&flagUseDoh, "use-doh", flagUseDoh, "use dns over https")
 	flag.Parse()
 
 	ctx, cancel := context.WithCancel(context.Background())
