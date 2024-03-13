@@ -46,6 +46,11 @@ func (a *DohApp) DohDialContext(ctx context.Context, network, addr string) (net.
 	if p >= 0 {
 		host = addr[:p]
 		suffix = addr[p:]
+	} else {
+		return nil, fmt.Errorf("invalid address format: " + addr)
+	}
+	if parsedIP := net.ParseIP(host); parsedIP != nil {
+		return net.Dial(network, addr)
 	}
 	rsp, err := a.c.Query(ctx, a.httpClient, dns.Domain(host), dns.TypeA)
 	if err != nil {
@@ -58,7 +63,7 @@ func (a *DohApp) DohDialContext(ctx context.Context, network, addr string) (net.
 }
 
 func main() {
-	var app DohApp
+	var dohApp DohApp
 	var flagConfig string
 	var flagPort int
 	var flagUseDoh = getEnvAsBool("USE_DOH")
@@ -76,17 +81,17 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	app.ctx = ctx
+	dohApp.ctx = ctx
 
 	if flagUseDoh {
-		app.c = doh.Use(doh.CloudflareProvider, doh.GoogleProvider)
+		dohApp.c = doh.Use(doh.CloudflareProvider, doh.GoogleProvider)
 		transport := bootstrapclient.StaticDnsTransport()
 		transport.Proxy = http.ProxyFromEnvironment
-		app.httpClient = &http.Client{
+		dohApp.httpClient = &http.Client{
 			Transport: transport,
 		}
 
-		defer app.c.Close()
+		defer dohApp.c.Close()
 	}
 
 	config := &model.Config{}
@@ -125,7 +130,7 @@ func main() {
 		},
 	}
 	if flagUseDoh {
-		transport.DialContext = app.DohDialContext
+		transport.DialContext = dohApp.DohDialContext
 	}
 	client := &http.Client{
 		Transport: transport,
