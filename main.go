@@ -16,11 +16,25 @@ import (
 	"strings"
 )
 
+func getEnvOrDefault(name string, def string) string {
+	value := os.Getenv(name)
+	if value == "" {
+		return def
+	}
+	return value
+}
+
 func main() {
 	var flagConfig string
 	var flagPort int
-	flag.IntVar(&flagPort, "port", 8000, "listen port")
-	flag.StringVar(&flagConfig, "config", os.Getenv("CONFIG_FILE"), "config file path")
+
+	defaultPort, err := strconv.Atoi(getEnvOrDefault("PORT", "8000"))
+	if err != nil {
+		log.Fatalln("parse PORT env failed: ", err)
+	}
+
+	flag.IntVar(&flagPort, "port", defaultPort, "listen port (env: PORT)")
+	flag.StringVar(&flagConfig, "config", os.Getenv("CONFIG_FILE"), "config file path (env: CONFIG_FILE)")
 	flag.Parse()
 
 	config := &model.Config{}
@@ -52,6 +66,7 @@ func main() {
 		}
 	}
 	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
 		TLSClientConfig: &tls.Config{
 			RootCAs: rootCAs,
 		},
