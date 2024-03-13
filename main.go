@@ -1,12 +1,16 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
 	"flag"
 	"fmt"
 	"github.com/jc-lab/docker-path-proxy-go/model"
+	"github.com/jclab-joseph/doh-go"
+	"github.com/jclab-joseph/doh-go/bootstrapclient"
+	"github.com/jclab-joseph/doh-go/dns"
 	"io"
 	"log"
 	"net"
@@ -24,9 +28,35 @@ func getEnvOrDefault(name string, def string) string {
 	return value
 }
 
+type DohApp struct {
+	ctx        context.Context
+	c          *doh.DoH
+	httpClient *http.Client
+}
+
+func (a *DohApp) DohDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	host := addr
+	p := strings.LastIndex(addr, ":")
+	suffix := ""
+	if p >= 0 {
+		host = addr[:p]
+		suffix = addr[p:]
+	}
+	rsp, err := a.c.Query(ctx, a.httpClient, dns.Domain(host), dns.TypeA)
+	if err != nil {
+		return nil, err
+	}
+	if len(rsp.Answer) <= 0 {
+		return nil, fmt.Errorf("resolve failed: " + host)
+	}
+	return net.Dial(network, rsp.Answer[0].Data+suffix)
+}
+
 func main() {
+	var app DohApp
 	var flagConfig string
 	var flagPort int
+	var flagUseDoh bool
 
 	defaultPort, err := strconv.Atoi(getEnvOrDefault("PORT", "8000"))
 	if err != nil {
@@ -35,7 +65,24 @@ func main() {
 
 	flag.IntVar(&flagPort, "port", defaultPort, "listen port (env: PORT)")
 	flag.StringVar(&flagConfig, "config", os.Getenv("CONFIG_FILE"), "config file path (env: CONFIG_FILE)")
+	flag.BoolVar(&flagUseDoh, "use-doh", false, "use dns over https")
 	flag.Parse()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	app.ctx = ctx
+
+	if flagUseDoh {
+		app.c = doh.Use(doh.CloudflareProvider, doh.GoogleProvider)
+		transport := bootstrapclient.StaticDnsTransport()
+		transport.Proxy = http.ProxyFromEnvironment
+		app.httpClient = &http.Client{
+			Transport: transport,
+		}
+
+		defer app.c.Close()
+	}
 
 	config := &model.Config{}
 	if flagConfig != "" {
@@ -65,11 +112,15 @@ func main() {
 			log.Printf("CaCertificates[%d] failed", i)
 		}
 	}
+
 	transport := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		TLSClientConfig: &tls.Config{
 			RootCAs: rootCAs,
 		},
+	}
+	if flagUseDoh {
+		transport.DialContext = app.DohDialContext
 	}
 	client := &http.Client{
 		Transport: transport,
