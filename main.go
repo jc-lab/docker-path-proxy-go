@@ -1,24 +1,31 @@
 package main
 
 import (
-	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
 	"flag"
 	"fmt"
 	"github.com/jc-lab/docker-path-proxy-go/model"
-	"github.com/jclab-joseph/doh-go"
-	"github.com/jclab-joseph/doh-go/bootstrapclient"
-	"github.com/jclab-joseph/doh-go/dns"
+	"github.com/jc-lab/docker-path-proxy-go/pkg/dockerlogin"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 )
+
+var (
+	regexRepoName = regexp.MustCompile("([^/]+)/([^/]+)")
+)
+
+type RepoAuthCache struct {
+	Token string
+}
 
 func getEnvOrDefault(name string, def string) string {
 	value := os.Getenv(name)
@@ -33,37 +40,14 @@ func getEnvAsBool(name string) bool {
 	return value == "true"
 }
 
-type DohApp struct {
-	ctx        context.Context
-	c          *doh.DoH
-	httpClient *http.Client
-}
-
-func (a *DohApp) DohDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
-	host := addr
-	p := strings.LastIndex(addr, ":")
-	suffix := ""
-	if p >= 0 {
-		host = addr[:p]
-		suffix = addr[p:]
-	} else {
-		return nil, fmt.Errorf("invalid address format: " + addr)
+func WrapHandler(f http.Handler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		log.Println("URL: ", r.RequestURI)
+		f.ServeHTTP(w, r)
 	}
-	if parsedIP := net.ParseIP(host); parsedIP != nil {
-		return net.Dial(network, addr)
-	}
-	rsp, err := a.c.Query(ctx, a.httpClient, dns.Domain(host), dns.TypeA)
-	if err != nil {
-		return nil, err
-	}
-	if len(rsp.Answer) <= 0 {
-		return nil, fmt.Errorf("resolve failed: " + host)
-	}
-	return net.Dial(network, rsp.Answer[0].Data+suffix)
 }
 
 func main() {
-	var dohApp DohApp
 	var flagConfig string
 	var flagPort int
 	var flagUseDoh = getEnvAsBool("USE_DOH")
@@ -77,22 +61,6 @@ func main() {
 	flag.StringVar(&flagConfig, "config", os.Getenv("CONFIG_FILE"), "config file path (env: CONFIG_FILE)")
 	flag.BoolVar(&flagUseDoh, "use-doh", flagUseDoh, "use dns over https")
 	flag.Parse()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	dohApp.ctx = ctx
-
-	if flagUseDoh {
-		dohApp.c = doh.Use(doh.CloudflareProvider, doh.GoogleProvider)
-		transport := bootstrapclient.StaticDnsTransport()
-		transport.Proxy = http.ProxyFromEnvironment
-		dohApp.httpClient = &http.Client{
-			Transport: transport,
-		}
-
-		defer dohApp.c.Close()
-	}
 
 	config := &model.Config{}
 	if flagConfig != "" {
@@ -111,6 +79,9 @@ func main() {
 		registries[registry.Path] = registry
 	}
 
+	var mutex sync.Mutex
+	repoAuthCaches := map[string]*RepoAuthCache{}
+
 	rootCAs, err := x509.SystemCertPool()
 	if err != nil {
 		log.Println("x509.SystemCertPool failed: ", err)
@@ -128,9 +99,6 @@ func main() {
 		TLSClientConfig: &tls.Config{
 			RootCAs: rootCAs,
 		},
-	}
-	if flagUseDoh {
-		transport.DialContext = dohApp.DohDialContext
 	}
 	client := &http.Client{
 		Transport: transport,
@@ -154,6 +122,11 @@ func main() {
 
 		domain := path[:pos]
 		suffix := path[pos+1:]
+		matches := regexRepoName.FindStringSubmatch(suffix)
+		repoCacheName := ""
+		if len(matches) > 2 {
+			repoCacheName = domain + "/" + matches[1] + "/" + matches[2]
+		}
 
 		var baseUrl string
 		registry := registries[domain]
@@ -170,21 +143,42 @@ func main() {
 
 		fullUri := baseUrl + "/" + suffix
 
-		newRequest, err := http.NewRequest(request.Method, fullUri, request.Body)
+		mutex.Lock()
+		repoCache, has := repoAuthCaches[repoCacheName]
+		if !has {
+			repoCache = &RepoAuthCache{}
+			repoAuthCaches[repoCacheName] = repoCache
+		}
+		mutex.Unlock()
+
+		prepareRequest := func() (*http.Request, error) {
+			newRequest, err := http.NewRequest(request.Method, fullUri, request.Body)
+			if err != nil {
+				return nil, err
+			}
+
+			if repoCache.Token != "" {
+				newRequest.Header.Set("Authorization", "bearer "+repoCache.Token)
+			}
+
+			for key, values := range request.Header {
+				for _, value := range values {
+					newRequest.Header.Add(key, value)
+				}
+			}
+
+			if registry != nil && registry.Username != "" {
+				newRequest.Header.Set("authorization", "basic "+base64.StdEncoding.EncodeToString([]byte(registry.Username+":"+registry.Password)))
+			}
+
+			return newRequest, nil
+		}
+
+		newRequest, err := prepareRequest()
 		if err != nil {
 			log.Printf("%s %d: %v", request.RequestURI, http.StatusInternalServerError, err)
 			http.Error(writer, "server error: "+err.Error(), http.StatusInternalServerError)
 			return
-		}
-
-		for key, values := range request.Header {
-			for _, value := range values {
-				newRequest.Header.Add(key, value)
-			}
-		}
-
-		if registry != nil && registry.Username != "" {
-			newRequest.Header.Set("authorization", "basic "+base64.StdEncoding.EncodeToString([]byte(registry.Username+":"+registry.Password)))
 		}
 
 		response, err := client.Do(newRequest)
@@ -192,6 +186,40 @@ func main() {
 			log.Printf("%s %d: %v", request.RequestURI, http.StatusInternalServerError, err)
 			http.Error(writer, "server error: "+err.Error(), http.StatusInternalServerError)
 			return
+		}
+		if response.StatusCode == 401 {
+			io.ReadAll(response.Body)
+
+			var wwwAuthenticate = response.Header.Get("www-authenticate")
+			if wwwAuthenticate != "" {
+				log.Printf("try login with www-authenticate: %s", wwwAuthenticate)
+				var username string
+				var password string
+				if registry != nil && registry.Username != "" {
+					username = registry.Username
+					password = registry.Password
+				}
+				tokenBody, err := dockerlogin.LoginRequest(client, wwwAuthenticate, username, password)
+				if err != nil {
+					log.Printf("login failed: %v", err)
+				} else {
+					repoCache.Token = tokenBody.Token
+
+					newRequest, err = prepareRequest()
+					if err != nil {
+						log.Printf("%s %d: %v", request.RequestURI, http.StatusInternalServerError, err)
+						http.Error(writer, "server error: "+err.Error(), http.StatusInternalServerError)
+						return
+					}
+
+					response, err = client.Do(newRequest)
+					if err != nil {
+						log.Printf("%s %d: %v", request.RequestURI, http.StatusInternalServerError, err)
+						http.Error(writer, "server error: "+err.Error(), http.StatusInternalServerError)
+						return
+					}
+				}
+			}
 		}
 
 		for key, values := range response.Header {
@@ -222,7 +250,7 @@ func main() {
 
 	log.Printf("listen on %s started", address)
 
-	if err := http.Serve(listener, mux); err != nil {
+	if err := http.Serve(listener, WrapHandler(mux)); err != nil {
 		log.Fatalln(err)
 	}
 }
